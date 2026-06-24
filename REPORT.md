@@ -12,6 +12,7 @@
 | Quantisation | NVFP4 | 4-bit (MLX) |
 | Hardware | MacBook Air M5, 32 GB unified memory | ← same |
 | OS | macOS 15 (Darwin 25.5.0) | ← same |
+| Thinking mode | disabled (`/no_think` + `"think": false`) | ← same |
 | Date | 2026-06-24 | ← same |
 
 ---
