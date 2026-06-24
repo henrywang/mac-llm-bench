@@ -1,0 +1,10 @@
+.venv/
+.env
+.DS_Store
+.claude/
+results/raw_*.csv
+results/summary.csv
+results/metrics_*.txt
+results/t4_*/
+__pycache__/
+*.pyc

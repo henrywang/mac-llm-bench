@@ -1,0 +1,8 @@
+/no_think
+Write a Python script called analyze_sales.py that does the following:
+1. Reads a CSV file named sales.csv with columns: date (YYYY-MM-DD), category (string), amount (float)
+2. Computes the monthly average amount per category
+3. Outputs a grouped bar chart using matplotlib showing each category's monthly average, with months on the x-axis
+4. Saves the chart to sales_chart.png
+
+Use type hints. Do not use pandas — use the csv module and collections only.

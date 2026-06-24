@@ -1,0 +1,1 @@
+Explain how a hash table works, including how it handles collisions, what load factor means, and when you would choose a hash table over a balanced BST. Be thorough.

@@ -1,0 +1,46 @@
+/no_think
+Summarize each of the following three news articles into 3 bullet points. Keep each bullet under 20 words.
+
+---
+
+ARTICLE 1: Apple Unveils M5 Ultra Chip With 32-Core CPU
+
+Apple on Monday announced the M5 Ultra, its most powerful chip to date, featuring a 32-core CPU,
+80-core GPU, and up to 192GB of unified memory. The chip is built using TSMC's second-generation
+3-nanometer process and connects two M5 Max dies using Apple's UltraFusion interconnect fabric,
+achieving memory bandwidth of 800GB/s. Apple claims the M5 Ultra delivers up to 2.4x the
+machine learning performance of the M3 Ultra, driven largely by a new 64-core Neural Engine.
+The chip will appear first in the new Mac Pro and Mac Studio configurations shipping next month,
+with prices starting at $3,999 and $1,999 respectively. Developers working with large AI models
+locally have been the primary target audience, with Apple emphasizing the chip's ability to run
+600-billion-parameter models without splitting them across machines.
+
+---
+
+ARTICLE 2: OpenAI Raises $10B at $300B Valuation in Latest Funding Round
+
+OpenAI closed a $10 billion funding round on Tuesday, pushing its valuation to $300 billion,
+making it the most valuable private company in the world. The round was led by SoftBank, with
+participation from existing investors Microsoft and Thrive Capital. The capital will be used
+primarily to expand compute infrastructure, including the buildout of additional data centers
+in the United States and Japan under the Stargate initiative. OpenAI CEO Sam Altman said
+the funds will allow the company to accelerate the development of its next-generation models
+and expand access to its products in emerging markets. The deal follows OpenAI's transition
+to a for-profit public benefit corporation structure completed earlier this year, which removed
+the cap on investor returns that had previously limited fundraising flexibility.
+
+---
+
+ARTICLE 3: EU Passes AI Liability Directive, Requiring Companies to Prove Fault
+
+The European Parliament voted 412 to 89 on Wednesday to pass the AI Liability Directive,
+a landmark piece of legislation that shifts the burden of proof in AI-related harm cases.
+Under the new rules, companies deploying high-risk AI systems — including those used in hiring,
+credit scoring, and medical diagnosis — must proactively disclose training data, model behavior
+logs, and risk assessments when a claimant alleges harm. If a company refuses or is unable to
+provide this documentation, courts may presume negligence. The directive applies to any company
+offering AI services to EU residents, regardless of where the company is headquartered, meaning
+US and Asian tech firms will need to comply. Companies have 24 months to achieve compliance.
+Industry groups including TechEU criticized the directive as creating excessive documentation
+burdens that could stifle innovation, while consumer advocates praised it as a necessary step
+toward AI accountability.

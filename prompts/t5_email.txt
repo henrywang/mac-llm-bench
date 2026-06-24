@@ -1,0 +1,91 @@
+/no_think
+Summarize this email thread and extract all action items with their owners.
+
+---
+
+From: Sarah Chen <s.chen@acme.com>
+To: eng-team@acme.com
+Date: Mon, 16 Jun 2026 09:12:00
+Subject: API rate limiting rollout — plan & blockers
+
+Hi team,
+
+Following last week's incident where a single client hammered the /search endpoint and took down
+the cluster for 40 minutes, we need to ship rate limiting before end of month. I want to align
+on the plan today.
+
+Current proposal: per-client token bucket at the API gateway layer, 1000 req/min default,
+configurable per tier. Redis-backed counters with a 60s sliding window.
+
+Blockers I'm aware of:
+- We don't have a Redis cluster in prod yet (only staging). Infrastructure ticket is open.
+- Client SDK needs to handle 429 responses gracefully. Right now it retries immediately,
+  which would make the problem worse.
+- Docs for the new headers (X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset)
+  need to be written before we can notify enterprise customers.
+
+Let me know your thoughts.
+Sarah
+
+---
+
+From: James Park <j.park@acme.com>
+To: eng-team@acme.com
+Date: Mon, 16 Jun 2026 10:34:00
+Subject: Re: API rate limiting rollout — plan & blockers
+
+Sarah,
+
+Infrastructure side: I can have the Redis cluster provisioned by Wednesday. I'll use the same
+spec as staging (3-node, r7g.large). I'll also need someone from the backend team to validate
+the connection config once it's up — it shouldn't take more than 30 minutes.
+
+One concern: the 60s sliding window means we need sub-second precision on the counter TTLs.
+Standard Redis EXPIRE is second-granularity. We should use PEXPIRE or the sorted-set pattern.
+Happy to pair with whoever implements the gateway logic.
+
+James
+
+---
+
+From: Priya Nair <p.nair@acme.com>
+To: eng-team@acme.com
+Date: Mon, 16 Jun 2026 11:58:00
+Subject: Re: API rate limiting rollout — plan & blockers
+
++1 on the sorted-set pattern — we used it in the payments service and it held up fine under load.
+
+On the SDK side: I can push a fix for the retry behavior this week. I'll add exponential backoff
+with jitter on 429, capped at 32s. I'll need the exact response schema for the 429 body so I
+can parse the Retry-After header correctly. Can someone confirm whether Retry-After will be
+in seconds or a timestamp?
+
+Also, do we need backward compat for SDK versions < 2.4? We have some enterprise customers
+still on 2.3.
+
+Priya
+
+---
+
+From: Sarah Chen <s.chen@acme.com>
+To: eng-team@acme.com
+Date: Mon, 16 Jun 2026 13:20:00
+Subject: Re: API rate limiting rollout — plan & blockers
+
+Good points all around.
+
+Retry-After will be in seconds (integer). I'll add that to the API spec doc today.
+Re: SDK backward compat — yes, we need to support 2.3 for at least 90 more days per our
+enterprise SLA. Priya, please make sure the backoff logic is backportable.
+
+On docs: Marcus, can you take the documentation for the new rate limit headers?
+Target: first draft by Thursday so we can send the customer notice Friday.
+
+I'll schedule a 30-min sync for Wednesday after James has Redis up to go over the
+connection config together. I'll send a calendar invite.
+
+Action items from my side:
+- API spec update with 429 body schema and Retry-After format — done by EOD today
+- Calendar invite for Wednesday sync
+
+Sarah

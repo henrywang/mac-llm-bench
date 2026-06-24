@@ -1,0 +1,6 @@
+{
+  "packages": [
+    "../pi-extensions/ollama.js",
+    "../pi-extensions/omlx.js"
+  ]
+}

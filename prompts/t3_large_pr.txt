@@ -1,0 +1,798 @@
+Summarize this pull request diff in one sentence.
+
+---
+
+diff --git a/src/auth/middleware.py b/src/auth/middleware.py
+index 3a2f1c8..9b4e72d 100644
+--- a/src/auth/middleware.py
++++ b/src/auth/middleware.py
+@@ -1,12 +1,18 @@
+ import jwt
+ import logging
++import time
+ from functools import wraps
+-from flask import request, jsonify
++from flask import request, jsonify, g
+ from src.models.user import User
++from src.cache import redis_client
++from src.auth.rate_limit import check_rate_limit, record_request
+
+ logger = logging.getLogger(__name__)
+
++TOKEN_CACHE_TTL = 300  # seconds
++RATE_LIMIT_WINDOW = 60  # seconds
++RATE_LIMIT_MAX = 100    # requests per window per user
+
+ def require_auth(f):
+     @wraps(f)
+     def decorated(*args, **kwargs):
+         token = request.headers.get('Authorization', '').replace('Bearer ', '')
+         if not token:
+             return jsonify({'error': 'Missing token'}), 401
+
++        # check rate limit before any DB/cache work
++        client_ip = request.remote_addr
++        if not check_rate_limit(client_ip, RATE_LIMIT_WINDOW, RATE_LIMIT_MAX):
++            logger.warning("rate limit exceeded for ip=%s", client_ip)
++            return jsonify({'error': 'Rate limit exceeded'}), 429
++
++        cached = redis_client.get(f'auth:token:{token}')
++        if cached:
++            g.user_id = int(cached)
++            record_request(client_ip)
++            return f(*args, **kwargs)
++
+         try:
+             payload = jwt.decode(token, current_app.config['JWT_SECRET'], algorithms=['HS256'])
+-            user = User.query.get(payload['sub'])
+-            if not user or not user.is_active:
+-                return jsonify({'error': 'Invalid token'}), 401
+-            g.current_user = user
++            user_id = payload['sub']
++            user = User.query.get(user_id)
++            if not user:
++                return jsonify({'error': 'User not found'}), 401
++            if not user.is_active:
++                return jsonify({'error': 'Account disabled'}), 403
++            if user.is_locked:
++                return jsonify({'error': 'Account locked'}), 403
++            g.current_user = user
++            g.user_id = user.id
++            redis_client.setex(f'auth:token:{token}', TOKEN_CACHE_TTL, user.id)
++            record_request(client_ip)
+         except jwt.ExpiredSignatureError:
+             return jsonify({'error': 'Token expired'}), 401
+         except jwt.InvalidTokenError as e:
++            logger.debug("invalid token from ip=%s: %s", client_ip, e)
+             return jsonify({'error': 'Invalid token'}), 401
+         return f(*args, **kwargs)
+     return decorated
+
++def require_role(role: str):
++    """Decorator that requires require_auth AND a specific role."""
++    def outer(f):
++        @wraps(f)
++        @require_auth
++        def decorated(*args, **kwargs):
++            user = g.get('current_user')
++            if user is None or user.role != role:
++                return jsonify({'error': 'Forbidden'}), 403
++            return f(*args, **kwargs)
++        return decorated
++    return outer
+
+diff --git a/src/auth/rate_limit.py b/src/auth/rate_limit.py
+new file mode 100644
+index 0000000..8a3f291
+--- /dev/null
++++ b/src/auth/rate_limit.py
+@@ -0,0 +1,48 @@
++"""Sliding-window rate limiter backed by Redis."""
++import time
++from src.cache import redis_client
++
++
++def _window_key(identifier: str, window_start: int) -> str:
++    return f"rl:{identifier}:{window_start}"
++
++
++def check_rate_limit(identifier: str, window_seconds: int, max_requests: int) -> bool:
++    """Return True if the request is allowed, False if rate-limited."""
++    now = int(time.time())
++    window_start = now - (now % window_seconds)
++    key = _window_key(identifier, window_start)
++
++    pipe = redis_client.pipeline()
++    pipe.incr(key)
++    pipe.expire(key, window_seconds * 2)
++    results = pipe.execute()
++
++    current_count = results[0]
++    return current_count <= max_requests
++
++
++def record_request(identifier: str, window_seconds: int = 60) -> None:
++    """Increment the counter for an already-allowed request (cache-hit path)."""
++    now = int(time.time())
++    window_start = now - (now % window_seconds)
++    key = _window_key(identifier, window_start)
++    pipe = redis_client.pipeline()
++    pipe.incr(key)
++    pipe.expire(key, window_seconds * 2)
++    pipe.execute()
++
++
++def reset_rate_limit(identifier: str, window_seconds: int = 60) -> None:
++    """Remove all rate-limit keys for an identifier (test helper)."""
++    now = int(time.time())
++    # clear current window and previous window to be safe
++    for offset in [0, window_seconds]:
++        window_start = (now - offset) - ((now - offset) % window_seconds)
++        key = _window_key(identifier, window_start)
++        redis_client.delete(key)
+
+diff --git a/src/auth/tokens.py b/src/auth/tokens.py
+index 1d4a823..f2c9341 100644
+--- a/src/auth/tokens.py
++++ b/src/auth/tokens.py
+@@ -1,8 +1,24 @@
+ import jwt
+ import datetime
++import secrets
++import logging
+ from src.config import settings
++from src.cache import redis_client
+
++logger = logging.getLogger(__name__)
+
++REVOKED_TOKEN_TTL = 86400  # keep revoked jti entries for 24 h
+
+ def generate_token(user_id: int, expiry_hours: int = 24) -> str:
++    jti = secrets.token_hex(16)
+     payload = {
+         'sub': user_id,
+         'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=expiry_hours),
+-        'iat': datetime.datetime.utcnow()
++        'iat': datetime.datetime.utcnow(),
++        'jti': jti
+     }
+     return jwt.encode(payload, settings.JWT_SECRET, algorithm='HS256')
+
++
++def revoke_token(token: str) -> bool:
++    """Blacklist a token by its jti. Returns False if token is invalid."""
++    try:
++        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=['HS256'])
++        jti = payload.get('jti')
++        if not jti:
++            return False
++        exp = payload.get('exp', 0)
++        ttl = max(0, exp - int(datetime.datetime.utcnow().timestamp()))
++        redis_client.setex(f'revoked:jti:{jti}', ttl or REVOKED_TOKEN_TTL, '1')
++        # also evict the per-token auth cache entry
++        redis_client.delete(f'auth:token:{token}')
++        logger.info("revoked token jti=%s for user=%s", jti, payload.get('sub'))
++        return True
++    except jwt.InvalidTokenError:
++        return False
++
++
++def is_token_revoked(jti: str) -> bool:
++    return bool(redis_client.exists(f'revoked:jti:{jti}'))
+
+diff --git a/src/auth/session.py b/src/auth/session.py
+new file mode 100644
+index 0000000..c7d3a12
+--- /dev/null
++++ b/src/auth/session.py
+@@ -0,0 +1,62 @@
++"""Server-side session tracking so admins can enumerate and invalidate active sessions."""
++import time
++import secrets
++import logging
++from src.cache import redis_client
++
++logger = logging.getLogger(__name__)
++
++SESSION_TTL = 86400  # 24 hours
++SESSION_PREFIX = 'session:'
++USER_SESSIONS_PREFIX = 'user_sessions:'
++
++
++def create_session(user_id: int, metadata: dict | None = None) -> str:
++    session_id = secrets.token_urlsafe(32)
++    key = f'{SESSION_PREFIX}{session_id}'
++    data = {
++        'user_id': str(user_id),
++        'created_at': str(int(time.time())),
++        'last_seen': str(int(time.time())),
++        **(metadata or {}),
++    }
++    pipe = redis_client.pipeline()
++    pipe.hset(key, mapping=data)
++    pipe.expire(key, SESSION_TTL)
++    pipe.sadd(f'{USER_SESSIONS_PREFIX}{user_id}', session_id)
++    pipe.expire(f'{USER_SESSIONS_PREFIX}{user_id}', SESSION_TTL)
++    pipe.execute()
++    logger.debug("created session %s for user %d", session_id, user_id)
++    return session_id
++
++
++def touch_session(session_id: str) -> bool:
++    key = f'{SESSION_PREFIX}{session_id}'
++    if not redis_client.exists(key):
++        return False
++    pipe = redis_client.pipeline()
++    pipe.hset(key, 'last_seen', str(int(time.time())))
++    pipe.expire(key, SESSION_TTL)
++    pipe.execute()
++    return True
++
++
++def get_session(session_id: str) -> dict | None:
++    key = f'{SESSION_PREFIX}{session_id}'
++    data = redis_client.hgetall(key)
++    return data if data else None
++
++
++def invalidate_session(session_id: str) -> None:
++    data = get_session(session_id)
++    if data:
++        user_id = data.get('user_id')
++        pipe = redis_client.pipeline()
++        pipe.delete(f'{SESSION_PREFIX}{session_id}')
++        if user_id:
++            pipe.srem(f'{USER_SESSIONS_PREFIX}{user_id}', session_id)
++        pipe.execute()
++
++
++def invalidate_all_sessions(user_id: int) -> int:
++    session_ids = redis_client.smembers(f'{USER_SESSIONS_PREFIX}{user_id}')
++    for sid in session_ids:
++        redis_client.delete(f'{SESSION_PREFIX}{sid}')
++    redis_client.delete(f'{USER_SESSIONS_PREFIX}{user_id}')
++    return len(session_ids)
+
+diff --git a/src/cache.py b/src/cache.py
+index 0000000..4c8f2b1
+--- /dev/null
++++ b/src/cache.py
+@@ -0,0 +1,28 @@
++import redis
++import os
++import logging
++
++logger = logging.getLogger(__name__)
++
++_client: redis.Redis | None = None
++
++
++def _make_client() -> redis.Redis:
++    return redis.Redis(
++        host=os.getenv('REDIS_HOST', 'localhost'),
++        port=int(os.getenv('REDIS_PORT', '6379')),
++        db=int(os.getenv('REDIS_DB', '0')),
++        password=os.getenv('REDIS_PASSWORD'),
++        socket_connect_timeout=2,
++        socket_timeout=2,
++        decode_responses=True,
++    )
++
++
++def get_client() -> redis.Redis:
++    global _client
++    if _client is None:
++        _client = _make_client()
++    return _client
++
++
++redis_client = get_client()
+
+diff --git a/src/models/user.py b/src/models/user.py
+index a1b2c33..9f4d811 100644
+--- a/src/models/user.py
++++ b/src/models/user.py
+@@ -1,14 +1,38 @@
+ from datetime import datetime
+-from src.db import db
++from src.db import db
++from sqlalchemy import event
+
+ class User(db.Model):
+     __tablename__ = 'users'
+
+     id = db.Column(db.Integer, primary_key=True)
+     email = db.Column(db.String(255), unique=True, nullable=False)
+-    password_hash = db.Column(db.String(128))
++    password_hash = db.Column(db.String(128), nullable=False)
+     is_active = db.Column(db.Boolean, default=True, nullable=False)
++    is_locked = db.Column(db.Boolean, default=False, nullable=False)
++    role = db.Column(db.String(32), default='user', nullable=False)
++    failed_login_attempts = db.Column(db.Integer, default=0, nullable=False)
++    last_login_at = db.Column(db.DateTime)
+     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
++    updated_at = db.Column(db.DateTime, default=datetime.utcnow,
++                           onupdate=datetime.utcnow, nullable=False)
+
++    MAX_FAILED_ATTEMPTS = 5
++
++    def record_failed_login(self) -> None:
++        self.failed_login_attempts += 1
++        if self.failed_login_attempts >= self.MAX_FAILED_ATTEMPTS:
++            self.is_locked = True
++        db.session.commit()
++
++    def record_successful_login(self) -> None:
++        self.failed_login_attempts = 0
++        self.last_login_at = datetime.utcnow()
++        db.session.commit()
++
++    def unlock(self) -> None:
++        self.is_locked = False
++        self.failed_login_attempts = 0
++        db.session.commit()
++
+     def __repr__(self) -> str:
+-        return f'<User {self.email}>'
++        return f'<User id={self.id} email={self.email} role={self.role}>'
++
++
++@event.listens_for(User, 'before_update')
++def _set_updated_at(mapper, connection, target):
++    target.updated_at = datetime.utcnow()
+
+diff --git a/migrations/versions/0012_add_user_lock_fields.py b/migrations/versions/0012_add_user_lock_fields.py
+new file mode 100644
+index 0000000..5b8a401
+--- /dev/null
++++ b/migrations/versions/0012_add_user_lock_fields.py
+@@ -0,0 +1,42 @@
++"""add is_locked, role, failed_login_attempts, last_login_at to users
++
++Revision ID: 0012
++Revises: 0011
++Create Date: 2024-03-15 10:22:00
++"""
++from alembic import op
++import sqlalchemy as sa
++
++revision = '0012'
++down_revision = '0011'
++
++
++def upgrade():
++    op.add_column('users', sa.Column('is_locked', sa.Boolean(),
++                  nullable=False, server_default='false'))
++    op.add_column('users', sa.Column('role', sa.String(length=32),
++                  nullable=False, server_default='user'))
++    op.add_column('users', sa.Column('failed_login_attempts', sa.Integer(),
++                  nullable=False, server_default='0'))
++    op.add_column('users', sa.Column('last_login_at', sa.DateTime(),
++                  nullable=True))
++    op.add_column('users', sa.Column('updated_at', sa.DateTime(),
++                  nullable=False, server_default=sa.func.now()))
++    op.create_index('ix_users_role', 'users', ['role'])
++    op.create_index('ix_users_is_locked', 'users', ['is_locked'])
++
++
++def downgrade():
++    op.drop_index('ix_users_is_locked', table_name='users')
++    op.drop_index('ix_users_role', table_name='users')
++    op.drop_column('users', 'updated_at')
++    op.drop_column('users', 'last_login_at')
++    op.drop_column('users', 'failed_login_attempts')
++    op.drop_column('users', 'role')
++    op.drop_column('users', 'is_locked')
+
+diff --git a/tests/test_auth.py b/tests/test_auth.py
+index 8c3d421..2e1f094 100644
+--- a/tests/test_auth.py
++++ b/tests/test_auth.py
+@@ -1,7 +1,8 @@
+ import unittest
++from unittest.mock import patch, MagicMock
+ from src.app import create_app
+ from src.db import db
+-from src.models.user import User
++from src.models.user import User
+ from src.auth.tokens import generate_token, revoke_token
+ from src.config import TestConfig
+
+@@ -12,6 +13,8 @@ class TestAuth(unittest.TestCase):
+         self.client = app.test_client()
+         self.user = User(id=1, email='test@example.com', is_active=True)
+         db.session.add(self.user)
++        self.redis_mock = patch('src.auth.middleware.redis_client').start()
++        self.redis_mock.get.return_value = None  # no cached tokens by default
+         db.session.commit()
+
+     def test_missing_token(self):
+@@ -28,6 +31,80 @@ class TestAuth(unittest.TestCase):
+         response = self.client.get('/api/data', headers={'Authorization': f'Bearer {token}'})
+         self.assertEqual(response.status_code, 200)
+
++    def test_cached_token(self):
++        token = generate_token(self.user.id)
++        self.redis_mock.get.return_value = str(self.user.id)
++        response = self.client.get('/api/data', headers={'Authorization': f'Bearer {token}'})
++        self.assertEqual(response.status_code, 200)
++        self.redis_mock.get.assert_called_once()
++
++    def test_disabled_account(self):
++        self.user.is_active = False
++        db.session.commit()
++        token = generate_token(self.user.id)
++        response = self.client.get('/api/data', headers={'Authorization': f'Bearer {token}'})
++        self.assertEqual(response.status_code, 403)
++
++    def test_locked_account(self):
++        self.user.is_locked = True
++        db.session.commit()
++        token = generate_token(self.user.id)
++        response = self.client.get('/api/data', headers={'Authorization': f'Bearer {token}'})
++        self.assertEqual(response.status_code, 403)
++
++    def test_revoked_token_rejected(self):
++        token = generate_token(self.user.id)
++        revoke_token(token)
++        response = self.client.get('/api/data', headers={'Authorization': f'Bearer {token}'})
++        self.assertEqual(response.status_code, 401)
++
++    def test_rate_limit_exceeded(self):
++        with patch('src.auth.middleware.check_rate_limit', return_value=False):
++            token = generate_token(self.user.id)
++            response = self.client.get('/api/data', headers={'Authorization': f'Bearer {token}'})
++            self.assertEqual(response.status_code, 429)
++
++    def test_require_role_allows_matching_role(self):
++        self.user.role = 'admin'
++        db.session.commit()
++        token = generate_token(self.user.id)
++        response = self.client.get('/api/admin/stats', headers={'Authorization': f'Bearer {token}'})
++        self.assertEqual(response.status_code, 200)
++
++    def test_require_role_blocks_wrong_role(self):
++        self.user.role = 'user'
++        db.session.commit()
++        token = generate_token(self.user.id)
++        response = self.client.get('/api/admin/stats', headers={'Authorization': f'Bearer {token}'})
++        self.assertEqual(response.status_code, 403)
++
++
++class TestRateLimit(unittest.TestCase):
++    def setUp(self):
++        self.redis_mock = patch('src.auth.rate_limit.redis_client').start()
++        pipeline_mock = MagicMock()
++        self.redis_mock.pipeline.return_value.__enter__ = lambda s: pipeline_mock
++        self.redis_mock.pipeline.return_value.__exit__ = MagicMock(return_value=False)
++        self.redis_mock.pipeline.return_value = pipeline_mock
++        pipeline_mock.execute.return_value = [1, True]
++
++    def tearDown(self):
++        patch.stopall()
++
++    def test_first_request_allowed(self):
++        from src.auth.rate_limit import check_rate_limit
++        self.redis_mock.pipeline.return_value.execute.return_value = [1, True]
++        self.assertTrue(check_rate_limit('127.0.0.1', 60, 100))
++
++    def test_over_limit_blocked(self):
++        from src.auth.rate_limit import check_rate_limit
++        self.redis_mock.pipeline.return_value.execute.return_value = [101, True]
++        self.assertFalse(check_rate_limit('127.0.0.1', 60, 100))
++
++    def test_exactly_at_limit_allowed(self):
++        from src.auth.rate_limit import check_rate_limit
++        self.redis_mock.pipeline.return_value.execute.return_value = [100, True]
++        self.assertTrue(check_rate_limit('127.0.0.1', 60, 100))
+
+diff --git a/tests/test_session.py b/tests/test_session.py
+new file mode 100644
+index 0000000..d9a3f22
+--- /dev/null
++++ b/tests/test_session.py
+@@ -0,0 +1,54 @@
++import unittest
++from unittest.mock import patch, MagicMock
++
++
++class TestSession(unittest.TestCase):
++    def setUp(self):
++        self.redis_mock = patch('src.auth.session.redis_client').start()
++        pipeline_mock = MagicMock()
++        self.redis_mock.pipeline.return_value = pipeline_mock
++        pipeline_mock.execute.return_value = [True, True, True, True]
++
++    def tearDown(self):
++        patch.stopall()
++
++    def test_create_session_returns_id(self):
++        from src.auth.session import create_session
++        sid = create_session(42)
++        self.assertIsInstance(sid, str)
++        self.assertGreater(len(sid), 20)
++
++    def test_get_session_returns_data(self):
++        from src.auth.session import get_session
++        self.redis_mock.hgetall.return_value = {'user_id': '42', 'created_at': '1700000000'}
++        data = get_session('someid')
++        self.assertIsNotNone(data)
++        self.assertEqual(data['user_id'], '42')
++
++    def test_get_session_missing_returns_none(self):
++        from src.auth.session import get_session
++        self.redis_mock.hgetall.return_value = {}
++        self.assertIsNone(get_session('missing'))
++
++    def test_touch_session_missing_returns_false(self):
++        from src.auth.session import touch_session
++        self.redis_mock.exists.return_value = 0
++        self.assertFalse(touch_session('missing'))
++
++    def test_invalidate_all_sessions(self):
++        from src.auth.session import invalidate_all_sessions
++        self.redis_mock.smembers.return_value = {'sid1', 'sid2', 'sid3'}
++        count = invalidate_all_sessions(42)
++        self.assertEqual(count, 3)
++        self.assertEqual(self.redis_mock.delete.call_count, 4)  # 3 sessions + 1 set key
+
+diff --git a/requirements.txt b/requirements.txt
+index 7c2d891..3f4e120 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -3,3 +3,5 @@
+  Flask==3.0.0
+  PyJWT==2.8.0
+  SQLAlchemy==2.0.23
++redis==5.0.1
++alembic==1.13.1
+
+diff --git a/docker-compose.yml b/docker-compose.yml
+index a3c4910..b1f2c33 100644
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -8,6 +8,18 @@ services:
+       - POSTGRES_DB=appdb
+     volumes:
+       - pgdata:/var/lib/postgresql/data
++
++  redis:
++    image: redis:7-alpine
++    ports:
++      - "6379:6379"
++    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
++    volumes:
++      - redisdata:/data
++    healthcheck:
++      test: ["CMD", "redis-cli", "ping"]
++      interval: 10s
++      timeout: 5s
++      retries: 3
+
+ volumes:
+   pgdata:
++  redisdata:
+
+diff --git a/src/api/auth_routes.py b/src/api/auth_routes.py
+index 0000000..7f3c901
+--- /dev/null
++++ b/src/api/auth_routes.py
+@@ -0,0 +1,96 @@
++"""Authentication API endpoints: login, logout, refresh, revoke, session list."""
++import logging
++from flask import Blueprint, request, jsonify, g
++from src.models.user import User
++from src.auth.tokens import generate_token, revoke_token
++from src.auth.middleware import require_auth
++from src.auth.session import create_session, invalidate_session, invalidate_all_sessions, get_session
++from src.auth.rate_limit import check_rate_limit
++from src.db import db
++from werkzeug.security import check_password_hash
++
++logger = logging.getLogger(__name__)
++auth_bp = Blueprint('auth', __name__, url_prefix='/api/auth')
++
++LOGIN_RATE_LIMIT_WINDOW = 300   # 5 minutes
++LOGIN_RATE_LIMIT_MAX = 10       # attempts per window per IP
++
++
++@auth_bp.post('/login')
++def login():
++    data = request.get_json(silent=True) or {}
++    email = data.get('email', '').strip().lower()
++    password = data.get('password', '')
++
++    if not email or not password:
++        return jsonify({'error': 'email and password required'}), 400
++
++    client_ip = request.remote_addr
++    if not check_rate_limit(client_ip, LOGIN_RATE_LIMIT_WINDOW, LOGIN_RATE_LIMIT_MAX):
++        logger.warning("login rate limit hit for ip=%s email=%s", client_ip, email)
++        return jsonify({'error': 'Too many login attempts. Try again later.'}), 429
++
++    user = User.query.filter_by(email=email).first()
++    if not user or not check_password_hash(user.password_hash, password):
++        if user:
++            user.record_failed_login()
++        logger.info("failed login attempt for email=%s from ip=%s", email, client_ip)
++        return jsonify({'error': 'Invalid credentials'}), 401
++
++    if not user.is_active:
++        return jsonify({'error': 'Account disabled'}), 403
++    if user.is_locked:
++        return jsonify({'error': 'Account locked. Contact support.'}), 403
++
++    user.record_successful_login()
++    token = generate_token(user.id)
++    session_id = create_session(user.id, metadata={
++        'ip': client_ip,
++        'user_agent': request.headers.get('User-Agent', '')[:200],
++    })
++    logger.info("successful login for user_id=%d from ip=%s", user.id, client_ip)
++    return jsonify({'token': token, 'session_id': session_id}), 200
++
++
++@auth_bp.post('/logout')
++@require_auth
++def logout():
++    token = request.headers.get('Authorization', '').replace('Bearer ', '')
++    session_id = request.get_json(silent=True, force=True).get('session_id') if request.data else None
++    revoke_token(token)
++    if session_id:
++        invalidate_session(session_id)
++    return jsonify({'message': 'Logged out'}), 200
++
++
++@auth_bp.post('/logout-all')
++@require_auth
++def logout_all():
++    token = request.headers.get('Authorization', '').replace('Bearer ', '')
++    user_id = g.user_id
++    revoke_token(token)
++    count = invalidate_all_sessions(user_id)
++    logger.info("user_id=%d invalidated all %d sessions", user_id, count)
++    return jsonify({'message': f'Logged out of {count} sessions'}), 200
++
++
++@auth_bp.get('/sessions')
++@require_auth
++def list_sessions():
++    from src.cache import redis_client
++    user_id = g.user_id
++    session_ids = redis_client.smembers(f'user_sessions:{user_id}')
++    sessions = []
++    for sid in session_ids:
++        data = get_session(sid)
++        if data:
++            sessions.append({'session_id': sid, **data})
++    return jsonify({'sessions': sessions}), 200
++
++
++@auth_bp.delete('/sessions/<session_id>')
++@require_auth
++def delete_session(session_id: str):
++    data = get_session(session_id)
++    if not data or str(data.get('user_id')) != str(g.user_id):
++        return jsonify({'error': 'Session not found'}), 404
++    invalidate_session(session_id)
++    return jsonify({'message': 'Session invalidated'}), 200
+
+diff --git a/tests/test_auth_routes.py b/tests/test_auth_routes.py
+new file mode 100644
+index 0000000..e8c4120
+--- /dev/null
++++ b/tests/test_auth_routes.py
+@@ -0,0 +1,88 @@
++import unittest
++from unittest.mock import patch, MagicMock
++from src.app import create_app
++from src.db import db
++from src.models.user import User
++from src.config import TestConfig
++from werkzeug.security import generate_password_hash
++
++
++class TestLoginEndpoint(unittest.TestCase):
++    def setUp(self):
++        app = create_app(TestConfig)
++        self.ctx = app.app_context()
++        self.ctx.push()
++        db.create_all()
++        self.client = app.test_client()
++        self.redis_patch = patch('src.auth.rate_limit.redis_client').start()
++        pipeline_mock = MagicMock()
++        pipeline_mock.execute.return_value = [1, True]
++        self.redis_patch.pipeline.return_value = pipeline_mock
++        self.session_patch = patch('src.auth.session.redis_client').start()
++        session_pipeline = MagicMock()
++        session_pipeline.execute.return_value = [True, True, True, True]
++        self.session_patch.pipeline.return_value = session_pipeline
++        pw = generate_password_hash('correct-password')
++        self.user = User(email='user@example.com', password_hash=pw, is_active=True)
++        db.session.add(self.user)
++        db.session.commit()
++
++    def tearDown(self):
++        patch.stopall()
++        db.session.remove()
++        db.drop_all()
++        self.ctx.pop()
++
++    def test_login_success(self):
++        resp = self.client.post('/api/auth/login',
++                                json={'email': 'user@example.com', 'password': 'correct-password'})
++        self.assertEqual(resp.status_code, 200)
++        data = resp.get_json()
++        self.assertIn('token', data)
++        self.assertIn('session_id', data)
++
++    def test_login_wrong_password(self):
++        resp = self.client.post('/api/auth/login',
++                                json={'email': 'user@example.com', 'password': 'wrong'})
++        self.assertEqual(resp.status_code, 401)
++
++    def test_login_unknown_email(self):
++        resp = self.client.post('/api/auth/login',
++                                json={'email': 'nobody@example.com', 'password': 'x'})
++        self.assertEqual(resp.status_code, 401)
++
++    def test_login_missing_fields(self):
++        resp = self.client.post('/api/auth/login', json={'email': 'user@example.com'})
++        self.assertEqual(resp.status_code, 400)
++
++    def test_login_disabled_account(self):
++        self.user.is_active = False
++        db.session.commit()
++        resp = self.client.post('/api/auth/login',
++                                json={'email': 'user@example.com', 'password': 'correct-password'})
++        self.assertEqual(resp.status_code, 403)
++
++    def test_login_locked_account(self):
++        self.user.is_locked = True
++        db.session.commit()
++        resp = self.client.post('/api/auth/login',
++                                json={'email': 'user@example.com', 'password': 'correct-password'})
++        self.assertEqual(resp.status_code, 403)
++
++    def test_login_rate_limited(self):
++        pipeline_mock = MagicMock()
++        pipeline_mock.execute.return_value = [11, True]
++        self.redis_patch.pipeline.return_value = pipeline_mock
++        resp = self.client.post('/api/auth/login',
++                                json={'email': 'user@example.com', 'password': 'correct-password'})
++        self.assertEqual(resp.status_code, 429)
+
+diff --git a/src/config.py b/src/config.py
+index 2b3c411..8d9a201 100644
+--- a/src/config.py
++++ b/src/config.py
+@@ -1,10 +1,22 @@
+ import os
++from dataclasses import dataclass, field
+
+
++@dataclass
+ class Settings:
+-    JWT_SECRET: str = os.getenv('JWT_SECRET', 'dev-secret-change-me')
+-    DATABASE_URL: str = os.getenv('DATABASE_URL', 'sqlite:///dev.db')
++    JWT_SECRET: str = field(default_factory=lambda: os.environ['JWT_SECRET'])
++    DATABASE_URL: str = field(default_factory=lambda: os.getenv('DATABASE_URL', 'sqlite:///dev.db'))
++    REDIS_HOST: str = field(default_factory=lambda: os.getenv('REDIS_HOST', 'localhost'))
++    REDIS_PORT: int = field(default_factory=lambda: int(os.getenv('REDIS_PORT', '6379')))
++    REDIS_PASSWORD: str | None = field(default_factory=lambda: os.getenv('REDIS_PASSWORD'))
++    TOKEN_CACHE_TTL: int = 300
++    SESSION_TTL: int = 86400
++    RATE_LIMIT_WINDOW: int = 60
++    RATE_LIMIT_MAX: int = 100
+
+
+ settings = Settings()
++
++
++class TestConfig:
++    TESTING = True
++    JWT_SECRET = 'test-secret'
++    DATABASE_URL = 'sqlite:///:memory:'
++    REDIS_HOST = 'localhost'
++    REDIS_PORT = 6379
++    REDIS_PASSWORD = None

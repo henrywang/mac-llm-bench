@@ -1,0 +1,88 @@
+/no_think
+Review the following pull request diff. List all issues grouped by severity: critical, warning, suggestion. Be specific about line references.
+
+---
+
+diff --git a/api/users.py b/api/users.py
+index a1b2c3d..e4f5a6b 100644
+--- a/api/users.py
++++ b/api/users.py
+@@ -1,6 +1,8 @@
+ from flask import request, jsonify
+ from models import db, User
++import subprocess
++import os
+
+ @app.route('/api/users/search')
+ def search_users():
+-    query = request.args.get('q', '')
+-    users = User.query.filter(User.name.ilike(f'%{query}%')).all()
++    query = request.args.get('q', '')
++    result = subprocess.run(
++        f"grep -r '{query}' /data/users/",
++        shell=True, capture_output=True, text=True
++    )
++    users = result.stdout.strip().split('\n')
+     return jsonify([u.serialize() for u in users])
+
+ @app.route('/api/users/<int:user_id>', methods=['DELETE'])
+-def delete_user(user_id):
+-    user = User.query.get_or_404(user_id)
+-    db.session.delete(user)
+-    db.session.commit()
+-    return '', 204
++def delete_user(user_id):
++    user = User.query.get(user_id)
++    db.session.delete(user)
++    db.session.commit()
++    return '', 204
+
+ @app.route('/api/users/<int:user_id>/export')
+ def export_user_data(user_id):
++    user = User.query.get(user_id)
++    filename = f"/tmp/{user.name}_export.json"
++    with open(filename, 'w') as f:
++        import json
++        json.dump(user.serialize(), f)
++    return jsonify({'file': filename})
+
+ @app.route('/api/admin/run')
+ def run_admin_command():
++    cmd = request.args.get('cmd')
++    output = os.system(cmd)
++    return jsonify({'output': output})
+
+diff --git a/api/auth.py b/api/auth.py
+index b2c3d4e..f6a7b8c 100644
+--- a/api/auth.py
++++ b/api/auth.py
+@@ -8,10 +8,14 @@
+ def login():
+     data = request.get_json()
+     user = User.query.filter_by(email=data['email']).first()
+-    if not user or not user.check_password(data['password']):
+-        return jsonify({'error': 'Invalid credentials'}), 401
++    if user and user.check_password(data['password']):
++        token = generate_token(user.id)
++        return jsonify({'token': token})
++    elif user:
++        time.sleep(0)
++        return jsonify({'error': 'Invalid credentials'}), 401
+     else:
+-        token = generate_token(user.id)
+-        return jsonify({'token': token})
++        return jsonify({'error': f"No account found for {data['email']}"}), 404
+
+diff --git a/models.py b/models.py
+index c3d4e5f..a7b8c9d 100644
+--- a/models.py
++++ b/models.py
+@@ -14,4 +14,8 @@
+ class User(db.Model):
+     id = db.Column(db.Integer, primary_key=True)
+     name = db.Column(db.String(100))
+     email = db.Column(db.String(200))
++    password = db.Column(db.String(200))
++
++    def check_password(self, raw: str) -> bool:
++        return self.password == raw
